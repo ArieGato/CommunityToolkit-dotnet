@@ -14,6 +14,7 @@ using System.Xml.Serialization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Nito.AsyncEx;
 
 namespace CommunityToolkit.Mvvm.UnitTests;
 
@@ -695,6 +696,221 @@ public partial class Test_RelayCommandAttribute
         Assert.IsNotNull(fooBarProperty.GetCustomAttribute<XmlIgnoreAttribute>());
     }
 
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_SuppressExceptionsHandlesFault()
+    {
+        ViewModelWithOnExecutionFailedHandler model = new();
+
+        // The command sets SuppressExceptions, so the generated subscription seeds the fault as
+        // handled and it must not be rethrown once the void(Exception) handler returns.
+        model.FailCommand.Execute(null);
+
+        Assert.IsNotNull(model.HandledException);
+        _ = Assert.IsInstanceOfType<InvalidOperationException>(model.HandledException);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_WithoutSuppressExceptionsStillRethrows()
+    {
+        ViewModelWithObservingOnlyOnExecutionFailedHandler model = new();
+
+        // SuppressExceptions defaults to false, so attaching a handler only observes the fault: the
+        // exception must still reach the caller, and only after the handler has seen it.
+        InvalidOperationException thrown = Assert.ThrowsExactly<InvalidOperationException>(() => model.FailCommand.Execute(null));
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.AreSame(model.ObservedException, thrown);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_SuppressExceptionsSeedsHandledBeforeEventArgsHandler()
+    {
+        ViewModelWithSuppressingEventArgsOnExecutionFailedHandler model = new();
+
+        // For an event args handler the seed is written before the call, so the handler observes the
+        // decision already made and can leave it alone, as this one does.
+        model.FailCommand.Execute(null);
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.IsTrue(model.HandledOnEntry);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_SuppressExceptionsSeedsHandledForGenericEventArgsHandler()
+    {
+        ViewModelWithGenericSuppressingEventArgsOnExecutionFailedHandler model = new();
+
+        // The seed lands before the call for the generic args shape too, so a handler reading the strongly
+        // typed parameter sees the decision already made and the fault is suppressed.
+        model.FailCommand.Execute("text");
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.AreEqual("text", model.ObservedParameter);
+        Assert.IsTrue(model.HandledOnEntry);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_EventArgsHandlerOverridesSuppressExceptions()
+    {
+        ViewModelWithSuppressionOverriddenByHandler model = new();
+
+        // SuppressExceptions is only a seed: an event args handler gets the last word, so setting
+        // Handled back to false puts the rethrow back for this particular fault.
+        InvalidOperationException thrown = Assert.ThrowsExactly<InvalidOperationException>(() => model.FailCommand.Execute(null));
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.AreSame(model.ObservedException, thrown);
+        Assert.IsTrue(model.HandledOnEntry);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_EventArgsHandlerObservesThenRethrowsIfNotHandled()
+    {
+        ViewModelWithOnExecutionFailedEventArgsHandler model = new();
+
+        // The generated command auto-subscribes the void(RelayCommandExceptionEventArgs) handler.
+        // As it never sets Handled to true, the exception must still propagate to the caller,
+        // but only after the handler has already observed it.
+        InvalidOperationException? rethrownException = null;
+
+        try
+        {
+            model.FailCommand.Execute(null);
+        }
+        catch (InvalidOperationException e)
+        {
+            rethrownException = e;
+        }
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.IsNotNull(rethrownException);
+        Assert.AreSame(model.ObservedException, rethrownException);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_AsyncCommandRoutesFaultToHandler()
+    {
+        ViewModelWithAsyncOnExecutionFailedHandler model = new();
+
+        // The generated async command subscribes the void(Exception) handler, which auto-handles
+        // the fault: nothing must escape to the synchronization context (AsyncContext.Run would
+        // rethrow it when the pumping loop completes). We deterministically wait for the fault to
+        // be routed instead of a fixed delay: a user handler attached after the generated one runs
+        // second in the multicast, so by the time it signals, HandledException has already been set.
+        AsyncContext.Run(async () =>
+        {
+            TaskCompletionSource<object?> executionFailedRaised = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            ((AsyncRelayCommand)model.FailCommand).ExecutionFailed += (s, e) => executionFailedRaised.SetResult(null);
+
+            model.FailCommand.Execute(null);
+
+            _ = await executionFailedRaised.Task;
+        });
+
+        Assert.IsNotNull(model.HandledException);
+        _ = Assert.IsInstanceOfType<InvalidOperationException>(model.HandledException);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_UserSubscriberRunsAfterGeneratedHandler()
+    {
+        ViewModelWithOnExecutionFailedHandler model = new();
+
+        // The generated subscription is added when the command is first created, so a user handler
+        // attached afterwards (by casting the interface-typed generated property to the concrete
+        // command type) runs second in the multicast invocation, and observes the Handled state
+        // the generated lambda has already seeded from SuppressExceptions.
+        bool userHandlerRan = false;
+        bool handledWhenUserHandlerRan = false;
+
+        ((RelayCommand)model.FailCommand).ExecutionFailed += (s, e) =>
+        {
+            userHandlerRan = true;
+            handledWhenUserHandlerRan = e.Handled;
+        };
+
+        model.FailCommand.Execute(null);
+
+        Assert.IsTrue(userHandlerRan);
+        Assert.IsTrue(handledWhenUserHandlerRan);
+        Assert.IsNotNull(model.HandledException);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_GenericCommandRoutesFaultAndParameterToHandler()
+    {
+        ViewModelWithGenericOnExecutionFailedHandler model = new();
+
+        // The generated subscription compiles against EventHandler<RelayCommandExceptionEventArgs<string>>:
+        // the emitted lambda passes the RelayCommandExceptionEventArgs<string> args to the handler's
+        // base-typed RelayCommandExceptionEventArgs parameter, an ordinary implicit reference conversion.
+        // As the handler sets Handled, nothing must escape here.
+        model.FailCommand.Execute("text");
+
+        Assert.IsNotNull(model.HandledException);
+        _ = Assert.IsInstanceOfType<InvalidOperationException>(model.HandledException);
+        Assert.AreEqual("text", model.HandledParameter);
+    }
+
+    [TestMethod]
+    public void Test_RelayCommandAttribute_OnExecutionFailed_GenericCommandWithGenericEventArgsHandlerReceivesTypedParameter()
+    {
+        ViewModelWithGenericEventArgsOnExecutionFailedHandler model = new();
+
+        // The handler takes RelayCommandExceptionEventArgs<string> directly, which is exactly the args
+        // type the generated RelayCommand<string> subscription raises, so the generated lambda passes it
+        // straight through and the handler reads e.Parameter with no downcast whatsoever.
+        model.FailCommand.Execute("text");
+
+        Assert.IsNotNull(model.HandledException);
+        _ = Assert.IsInstanceOfType<InvalidOperationException>(model.HandledException);
+        Assert.AreEqual("text", model.HandledParameter);
+    }
+
+    [TestMethod]
+    public async Task Test_RelayCommandAttribute_OnExecutionFailed_GenericAsyncCommandRoutesAwaitedFaultToHandler()
+    {
+        ViewModelWithGenericAsyncOnExecutionFailedHandler model = new();
+
+        // The generated void(Exception) handler observes the fault on this path too, but marking it as
+        // handled only suppresses the rethrow on the ICommand.Execute path: ExecuteAsync returns the
+        // execution task itself, so a caller awaiting it always sees the exception.
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => model.FailCommand.ExecuteAsync("text"));
+
+        Assert.IsNotNull(model.HandledException);
+        Assert.AreSame(model.HandledException, thrown);
+    }
+
+    [TestMethod]
+    public async Task Test_RelayCommandAttribute_OnExecutionFailed_AsyncCommandRoutesAwaitedFaultToHandler()
+    {
+        ViewModelWithAsyncOnExecutionFailedHandler model = new();
+
+        // Same as above for the parameterless async command: the generated handler is subscribed when
+        // the command is created, so the directly awaited ExecuteAsync routes the fault to it, and the
+        // awaiter still observes the exception itself.
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => model.FailCommand.ExecuteAsync(null));
+
+        Assert.IsNotNull(model.HandledException);
+        Assert.AreSame(model.HandledException, thrown);
+    }
+
+    [TestMethod]
+    public async Task Test_RelayCommandAttribute_OnExecutionFailed_AsyncCommandWithEventArgsHandlerRethrowsAwaitedFaultIfNotHandled()
+    {
+        ViewModelWithAsyncOnExecutionFailedEventArgsHandler model = new();
+
+        // This command does not set SuppressExceptions, so the generated lambda never touches Handled.
+        // That makes no difference on this path (the awaited task always faults regardless of what the
+        // handler does), but the handler must still have observed the very same exception that surfaces
+        // at the await.
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => model.FailCommand.ExecuteAsync(null));
+
+        Assert.IsNotNull(model.ObservedException);
+        Assert.AreSame(model.ObservedException, thrown);
+    }
+
     #region Region
     public class Region
     {
@@ -1276,6 +1492,227 @@ public partial class Test_RelayCommandAttribute
         private partial Task FooBarAsync()
         {
             return Task.CompletedTask;
+        }
+    }
+
+    public sealed partial class ViewModelWithOnExecutionFailedHandler
+    {
+        public Exception? HandledException { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private void Fail()
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(Exception exception)
+        {
+            HandledException = exception;
+        }
+    }
+
+    public sealed partial class ViewModelWithObservingOnlyOnExecutionFailedHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        // No SuppressExceptions, which is the default: the handler observes the fault and the
+        // exception then propagates exactly as it would with no handler attached at all.
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed))]
+        private void Fail()
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(Exception exception)
+        {
+            ObservedException = exception;
+        }
+    }
+
+    public sealed partial class ViewModelWithSuppressingEventArgsOnExecutionFailedHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        public bool HandledOnEntry { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private void Fail()
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(RelayCommandExceptionEventArgs e)
+        {
+            ObservedException = e.Exception;
+
+            // The seed is written before the call for this shape, so it is already visible here
+            HandledOnEntry = e.Handled;
+        }
+    }
+
+    public sealed partial class ViewModelWithGenericSuppressingEventArgsOnExecutionFailedHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        public string? ObservedParameter { get; private set; }
+
+        public bool HandledOnEntry { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private void Fail(string text)
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        // The generic args shape is seeded the same way the non-generic one is, before the call, so the
+        // strongly typed parameter and the seeded state are both readable here
+        private void OnFailFailed(RelayCommandExceptionEventArgs<string> e)
+        {
+            ObservedException = e.Exception;
+            ObservedParameter = e.Parameter;
+            HandledOnEntry = e.Handled;
+        }
+    }
+
+    public sealed partial class ViewModelWithSuppressionOverriddenByHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        public bool HandledOnEntry { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private void Fail()
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(RelayCommandExceptionEventArgs e)
+        {
+            ObservedException = e.Exception;
+            HandledOnEntry = e.Handled;
+
+            // The handler gets the last word, so this puts the rethrow back
+            e.Handled = false;
+        }
+    }
+
+    public sealed partial class ViewModelWithOnExecutionFailedEventArgsHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed))]
+        private void Fail()
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(RelayCommandExceptionEventArgs e)
+        {
+            ObservedException = e.Exception;
+
+            // Intentionally does not set e.Handled = true, so the exception is rethrown.
+        }
+    }
+
+    public sealed partial class ViewModelWithAsyncOnExecutionFailedHandler
+    {
+        public Exception? HandledException { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private async Task FailAsync()
+        {
+            await Task.CompletedTask;
+
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(Exception exception)
+        {
+            HandledException = exception;
+        }
+    }
+
+    public sealed partial class ViewModelWithAsyncOnExecutionFailedEventArgsHandler
+    {
+        public Exception? ObservedException { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed))]
+        private async Task FailAsync()
+        {
+            await Task.CompletedTask;
+
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(RelayCommandExceptionEventArgs e)
+        {
+            ObservedException = e.Exception;
+
+            // Intentionally does not set e.Handled = true, so the fault is rethrown by the awaited task.
+        }
+    }
+
+    public sealed partial class ViewModelWithGenericOnExecutionFailedHandler
+    {
+        public Exception? HandledException { get; private set; }
+
+        public string? HandledParameter { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed))]
+        private void Fail(string text)
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(RelayCommandExceptionEventArgs e)
+        {
+            HandledException = e.Exception;
+
+            // The runtime instance is the generic args type, so the strongly typed parameter is available
+            HandledParameter = ((RelayCommandExceptionEventArgs<string>)e).Parameter;
+
+            e.Handled = true;
+        }
+    }
+
+    public sealed partial class ViewModelWithGenericEventArgsOnExecutionFailedHandler
+    {
+        public Exception? HandledException { get; private set; }
+
+        public string? HandledParameter { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed))]
+        private void Fail(string text)
+        {
+            throw new InvalidOperationException("Test");
+        }
+
+        // The handler declares the generic args type closed over the command parameter type, so the
+        // strongly typed Parameter is reachable with no cast at all in the user's own code.
+        private void OnFailFailed(RelayCommandExceptionEventArgs<string> e)
+        {
+            HandledException = e.Exception;
+            HandledParameter = e.Parameter;
+
+            e.Handled = true;
+        }
+    }
+
+    public sealed partial class ViewModelWithGenericAsyncOnExecutionFailedHandler
+    {
+        public Exception? HandledException { get; private set; }
+
+        [RelayCommand(OnExecutionFailed = nameof(OnFailFailed), SuppressExceptions = true)]
+        private async Task FailAsync(string text)
+        {
+            await Task.CompletedTask;
+
+            throw new InvalidOperationException("Test");
+        }
+
+        private void OnFailFailed(Exception exception)
+        {
+            HandledException = exception;
         }
     }
 }
