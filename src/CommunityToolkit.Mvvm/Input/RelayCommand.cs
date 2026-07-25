@@ -32,6 +32,19 @@ public sealed partial class RelayCommand : IRelayCommand
     public event EventHandler? CanExecuteChanged;
 
     /// <summary>
+    /// Raised when the execution of the wrapped delegate throws an exception. If at least one handler
+    /// is attached when the exception is raised, it is passed to the event, and only rethrown if no
+    /// handler sets <see cref="RelayCommandExceptionEventArgs.Handled"/> to <see langword="true"/>.
+    /// Handlers are read when the exception is raised, following standard event semantics. The one
+    /// deviation is that if no handler is attached when <see cref="Execute"/> is invoked, the delegate runs
+    /// without any exception handling in place, so a handler attached while it is running is not notified
+    /// for that execution. If no
+    /// handler is attached, the exception propagates to the caller unchanged, exactly as if this event
+    /// did not exist.
+    /// </summary>
+    public event EventHandler<RelayCommandExceptionEventArgs>? ExecutionFailed;
+
+    /// <summary>
     /// Initializes a new instance of the <see cref="RelayCommand"/> class that can always execute.
     /// </summary>
     /// <param name="execute">The execution logic.</param>
@@ -74,6 +87,47 @@ public sealed partial class RelayCommand : IRelayCommand
     /// <inheritdoc/>
     public void Execute(object? parameter)
     {
-        this.execute();
+        // The event is checked here, before the delegate runs, purely so that the common case of no
+        // subscriber contains no exception handling region at all: that keeps this method eligible for
+        // inlining, which a try/catch would prevent regardless of any attribute.
+        if (ExecutionFailed is null)
+        {
+            this.execute();
+        }
+        else
+        {
+            ExecuteAndRouteExecutionFailed();
+        }
+    }
+
+    /// <summary>
+    /// Invokes the wrapped delegate and routes an exception to <see cref="ExecutionFailed"/>, rethrowing
+    /// it if no handler marks it as handled. This is kept separate from <see cref="Execute"/> so that the
+    /// exception handling region only exists on the path that actually needs it.
+    /// </summary>
+    private void ExecuteAndRouteExecutionFailed()
+    {
+        try
+        {
+            this.execute();
+        }
+        catch (Exception e)
+        {
+            // Standard event semantics: the handler list is read when the event is raised, so a handler
+            // detached while the delegate was running is not notified, and the exception just propagates.
+            if (ExecutionFailed is not EventHandler<RelayCommandExceptionEventArgs> executionFailed)
+            {
+                throw;
+            }
+
+            RelayCommandExceptionEventArgs args = new(e);
+
+            executionFailed(this, args);
+
+            if (!args.Handled)
+            {
+                throw;
+            }
+        }
     }
 }
