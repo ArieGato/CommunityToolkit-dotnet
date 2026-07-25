@@ -944,4 +944,84 @@ internal static class DiagnosticDescriptors
         isEnabledByDefault: true,
         description: "Semi-auto properties should be converted to partial properties using [ObservableProperty] when possible, which is recommended (doing so makes the code less verbose and results in more optimized code).",
         helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0056");
+
+    /// <summary>
+    /// Gets a <see cref="DiagnosticDescriptor"/> for when <c>[RelayCommand]</c> uses an <c>OnExecutionFailed</c> name that does not match any member.
+    /// <para>
+    /// Format: <c>"The OnExecutionFailed name must refer to a valid member, but "{0}" has no matches in type {1}"</c>.
+    /// </para>
+    /// </summary>
+    public static readonly DiagnosticDescriptor InvalidOnExecutionFailedMemberNameError = new DiagnosticDescriptor(
+        id: "MVVMTK0057",
+        title: "Invalid OnExecutionFailed member name",
+        messageFormat: """The OnExecutionFailed name must refer to a valid member, but "{0}" has no matches in type {1}""",
+        category: typeof(RelayCommandGenerator).FullName,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "The OnExecutionFailed name in [RelayCommand] must refer to a valid member in its parent type.",
+        helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0057");
+
+    /// <summary>
+    /// Gets a <see cref="DiagnosticDescriptor"/> for when <c>[RelayCommand]</c> uses an <c>OnExecutionFailed</c> member with an invalid signature.
+    /// <para>
+    /// Format: <c>"The OnExecutionFailed member "{0}" in type {1} has an invalid signature (it must be a void method with a single System.Exception or CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs parameter)"</c>.
+    /// </para>
+    /// </summary>
+    public static readonly DiagnosticDescriptor InvalidOnExecutionFailedMemberSignatureError = new DiagnosticDescriptor(
+        id: "MVVMTK0058",
+        title: "Invalid OnExecutionFailed member signature",
+        messageFormat: """The OnExecutionFailed member "{0}" in type {1} has an invalid signature (it must be a void method with a single System.Exception or CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs parameter)""",
+        category: typeof(RelayCommandGenerator).FullName,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "The OnExecutionFailed member in [RelayCommand] must be a void method with a single System.Exception or CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs parameter.",
+        helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0058");
+
+    /// <summary>
+    /// Gets a <see cref="DiagnosticDescriptor"/> for when <c>[RelayCommand]</c> uses an <c>OnExecutionFailed</c> name that matches multiple members.
+    /// <para>
+    /// Format: <c>"The OnExecutionFailed name "{0}" has multiple matches in type {1} (it must match a single void method with a System.Exception or CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs parameter)"</c>.
+    /// </para>
+    /// </summary>
+    public static readonly DiagnosticDescriptor MultipleOnExecutionFailedMemberMatchesError = new DiagnosticDescriptor(
+        id: "MVVMTK0059",
+        title: "Multiple OnExecutionFailed member matches",
+        messageFormat: """The OnExecutionFailed name "{0}" has multiple matches in type {1} (it must match a single void method with a System.Exception or CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs parameter)""",
+        category: typeof(RelayCommandGenerator).FullName,
+        defaultSeverity: DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "Cannot set the OnExecutionFailed name in [RelayCommand] to one that has multiple matches in its parent type (it must refer to a single compatible member).",
+        helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0059");
+
+    /// <summary>
+    /// Gets a <see cref="DiagnosticDescriptor"/> indicating when the OnExecutionFailed member for [RelayCommand] is an async void method.
+    /// <para>
+    /// Format: <c>"The OnExecutionFailed name "{0}" in type {1} refers to an async void method, which cannot be awaited by the command"</c>.
+    /// </para>
+    /// </summary>
+    public static readonly DiagnosticDescriptor AsyncVoidOnExecutionFailedMemberWarning = new DiagnosticDescriptor(
+        id: "MVVMTK0060",
+        title: "Async void OnExecutionFailed member",
+        messageFormat: """The OnExecutionFailed name "{0}" in type {1} refers to an async void method: the command cannot await it, so the fault is treated as observed as soon as the method reaches its first await, and any exception thrown after that point is rethrown on the synchronization context instead of being handled""",
+        category: typeof(RelayCommandGenerator).FullName,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true,
+        description: "The OnExecutionFailed name in [RelayCommand] should not refer to an async void method, as the command has no way to await it: the handler returns at its first await, so the exception is considered observed before the handler has finished, and exceptions thrown by the remainder of the method reach the synchronization context unhandled. Do the asynchronous work in a separate, explicitly guarded method instead.",
+        helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0060");
+
+    /// <summary>
+    /// Gets a <see cref="DiagnosticDescriptor"/> for when <c>[RelayCommand]</c> sets <c>SuppressExceptions</c> without <c>OnExecutionFailed</c>.
+    /// <para>
+    /// Format: <c>"The SuppressExceptions property in [RelayCommand] has no effect on method "{0}" in type {1}, as it is only used when OnExecutionFailed is also set"</c>.
+    /// </para>
+    /// </summary>
+    public static readonly DiagnosticDescriptor UnusedSuppressExceptionsWarning = new DiagnosticDescriptor(
+        id: "MVVMTK0061",
+        title: "Unused SuppressExceptions property",
+        messageFormat: """The SuppressExceptions property in [RelayCommand] has no effect on method "{0}" in type {1}, as it only seeds the handled state of a fault routed to an OnExecutionFailed handler, and no such handler is set""",
+        category: typeof(RelayCommandGenerator).FullName,
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true,
+        description: "The SuppressExceptions property in [RelayCommand] is only used when OnExecutionFailed is also set: it seeds the initial handled state of a fault routed to that handler. Without a handler, no ExecutionFailed subscription is generated and the property does nothing.",
+        helpLinkUri: "https://aka.ms/mvvmtoolkit/errors/mvvmtk0061");
 }

@@ -116,4 +116,65 @@ public sealed class RelayCommandAttribute : Attribute
     /// </summary>
     /// <remarks>Using this property is not valid if the target command doesn't map to a cancellable asynchronous command.</remarks>
     public bool IncludeCancelCommand { get; init; }
+
+    /// <summary>
+    /// Gets or sets the name of the method that will be invoked when the command execution throws an
+    /// exception. The referenced method must return <see langword="void"/> and take either a single
+    /// <see cref="Exception"/> parameter, or a single event arguments parameter (see below for the
+    /// supported event arguments types).
+    /// <para>
+    /// Referencing a handler only observes the fault: by default the exception still propagates exactly
+    /// as it would with no handler attached. Whether it is instead considered handled is controlled by
+    /// <see cref="SuppressExceptions"/>, independently of which parameter type the handler declares. A
+    /// handler taking event arguments can also override that decision per fault, by assigning
+    /// <see cref="RelayCommandExceptionEventArgs.Handled"/>.
+    /// </para>
+    /// <para>
+    /// The handler is subscribed to the <c>ExecutionFailed</c> event of the generated command when the
+    /// command instance is first created.
+    /// </para>
+    /// <para>
+    /// For asynchronous commands it participates in both execution paths: faults are routed to it when
+    /// execution is driven through <see cref="ICommand.Execute(object?)"/> as well as when the task
+    /// returned by <c>ExecuteAsync</c> is awaited directly by the caller. Marking a fault as handled only
+    /// suppresses the rethrow on the <see cref="ICommand.Execute(object?)"/> path: <c>ExecuteAsync</c>
+    /// always returns the execution task itself, so a caller awaiting it always observes the exception,
+    /// regardless of what the handler does. A canceled execution never invokes the handler.
+    /// </para>
+    /// <para>
+    /// For commands with a parameter, the event arguments are <see cref="RelayCommandExceptionEventArgs{T}"/>,
+    /// which also expose the strongly typed parameter that was passed to the failing execution. Such a command
+    /// also accepts a handler declared with a single <see cref="RelayCommandExceptionEventArgs{T}"/> parameter,
+    /// as long as <c>T</c> is exactly the command parameter type, which is the simplest way to reach the
+    /// strongly typed parameter. A handler declared with the non-generic
+    /// <see cref="RelayCommandExceptionEventArgs"/> parameter still binds too, and can cast to the generic
+    /// type to reach it. Both event args shapes behave identically with respect to
+    /// <see cref="RelayCommandExceptionEventArgs.Handled"/>.
+    /// </para>
+    /// </summary>
+    public string? OnExecutionFailed { get; init; }
+
+    /// <summary>
+    /// Gets or sets whether a fault routed to <see cref="OnExecutionFailed"/> is considered handled.
+    /// This is the initial value of <see cref="RelayCommandExceptionEventArgs.Handled"/>, which a handler
+    /// taking event arguments can then override in either direction. The default is <see langword="false"/>,
+    /// so that attaching a handler observes the fault without changing whether it propagates.
+    /// </summary>
+    /// <remarks>
+    /// When this is set to <see langword="true"/>, an exception thrown by the command delegate does not
+    /// propagate out of <see cref="ICommand.Execute(object?)"/>, including the rethrow onto the captured
+    /// synchronization context that an asynchronous command would otherwise perform.
+    /// <para>
+    /// This does not extend to a caller awaiting the task returned by <c>ExecuteAsync</c>: that task is the
+    /// execution task itself, so such a caller always observes the fault regardless of this setting. It also
+    /// does not cover an exception thrown by the handler, and a canceled execution never invokes the handler
+    /// at all.
+    /// </para>
+    /// <para>
+    /// Setting this without also setting <see cref="OnExecutionFailed"/> has no effect, and is reported as a
+    /// warning: with no handler to subscribe, the generated command has no <c>ExecutionFailed</c>
+    /// subscription for this value to seed.
+    /// </para>
+    /// </remarks>
+    public bool SuppressExceptions { get; init; }
 }

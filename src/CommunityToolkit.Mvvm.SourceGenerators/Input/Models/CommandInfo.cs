@@ -23,6 +23,9 @@ namespace CommunityToolkit.Mvvm.SourceGenerators.Input.Models;
 /// <param name="AllowConcurrentExecutions">Whether or not concurrent executions have been enabled.</param>
 /// <param name="FlowExceptionsToTaskScheduler">Whether or not exceptions should flow to the task scheduler.</param>
 /// <param name="IncludeCancelCommand">Whether or not to also generate a cancel command.</param>
+/// <param name="OnExecutionFailedMemberName">The member name for the exception handler, if available.</param>
+/// <param name="OnExecutionFailedUsesEventArgs">Whether the exception handler takes event args (otherwise, an exception).</param>
+/// <param name="SuppressExceptions">Whether a routed fault is seeded as handled, suppressing the rethrow.</param>
 /// <param name="ForwardedAttributes">The sequence of forwarded attributes for the generated members.</param>
 internal sealed record CommandInfo(
     string MethodName,
@@ -38,4 +41,7 @@ internal sealed record CommandInfo(
     bool AllowConcurrentExecutions,
     bool FlowExceptionsToTaskScheduler,
     bool IncludeCancelCommand,
+    string? OnExecutionFailedMemberName,
+    bool OnExecutionFailedUsesEventArgs,
+    bool SuppressExceptions,
     EquatableArray<AttributeInfo> ForwardedAttributes);

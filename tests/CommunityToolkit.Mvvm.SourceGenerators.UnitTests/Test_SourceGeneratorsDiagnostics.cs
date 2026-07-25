@@ -2475,6 +2475,659 @@ public partial class Test_SourceGeneratorsDiagnostics
             editorconfig: [("_MvvmToolkitIsUsingWindowsRuntimePack", true), ("CsWinRTAotOptimizerEnabled", "auto")]);
     }
 
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberName()
+    {
+        const string source = """
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = "MissingMethod")]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0057");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature()
+    {
+        const string source = """
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(string message)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithNoParameters()
+    {
+        const string source = """
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithTwoParameters()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(Exception a, Exception b)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithNonVoidReturnType()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private bool OnGreetUserFailed(Exception exception)
+                {
+                    return true;
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void ValidRelayCommandOnExecutionFailedMemberSignature_WithMatchingGenericEventArgsParameter()
+    {
+        // A parameterised command raises its event with RelayCommandExceptionEventArgs<T>, where T is the
+        // command parameter type, so a handler declared with exactly that type is a valid shape: the
+        // generated subscription can pass the event args straight through with no cast. This is checked
+        // for both the synchronous and the asynchronous generic command shapes. The language version is
+        // raised here because this source is expected to generate and compile cleanly.
+        const string source = """
+            using System.Threading;
+            using System.Threading.Tasks;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser(string name)
+                {
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs<string> e)
+                {
+                }
+            }
+
+            public partial class SampleViewModel2
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private Task GreetUserAsync(int age)
+                {
+                    return Task.CompletedTask;
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs<int> e)
+                {
+                }
+            }
+
+            public partial class SampleViewModel3
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private Task GreetUserAsync(int age, CancellationToken token)
+                {
+                    return Task.CompletedTask;
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs<int> e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithMismatchedGenericEventArgsParameter()
+    {
+        // The command raises RelayCommandExceptionEventArgs<string>, so a handler taking the generic args
+        // closed over any other type could never be passed the event args, and is rejected as invalid.
+        const string source = """
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser(string name)
+                {
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs<int> e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithGenericEventArgsParameterOnParameterlessCommand()
+    {
+        // A parameterless command raises the non-generic RelayCommandExceptionEventArgs, so no generic
+        // instantiation of the args type is ever a valid handler parameter for it.
+        const string source = """
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs<string> e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithOutParameter()
+    {
+        // An 'out' parameter has a matching parameter type, but the generated subscription passes the
+        // exception by value, so accepting it would emit a call failing with CS1620 inside the generated
+        // file. The handler is reported as having an invalid signature instead.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(out Exception e)
+                {
+                    e = null!;
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithRefParameter()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(ref Exception e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithGenericMethod()
+    {
+        // The generated call site passes no type arguments, so a generic handler cannot have its type
+        // arguments inferred (CS0411 in the generated file). It is rejected as an invalid signature.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed<TAny>(Exception e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberSignature_WithPrivateMemberInBaseClass()
+    {
+        // Candidate handlers are gathered across the whole base type hierarchy, but a private member of a
+        // base type cannot be called from the derived type the code is generated into (CS0122 in the
+        // generated file). It is rejected as an invalid signature.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public class BaseViewModel
+            {
+                private void OnGreetUserFailed(Exception e)
+                {
+                }
+            }
+
+            public partial class SampleViewModel : BaseViewModel
+            {
+                [RelayCommand(OnExecutionFailed = "OnGreetUserFailed")]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0058");
+    }
+
+    [TestMethod]
+    public void ValidRelayCommandOnExecutionFailedMemberSignature_WithInParameterOrStaticMember()
+    {
+        // Neither an 'in' parameter nor a static handler stops the generated call from compiling, so the
+        // extra validation on candidate handlers must not reject them. A protected member in a base class
+        // is callable from the derived type as well, so it is also still accepted. The language version is
+        // raised here because this source is expected to generate and compile cleanly.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(in Exception e)
+                {
+                }
+            }
+
+            public partial class SampleViewModel2
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private static void OnGreetUserFailed(Exception e)
+                {
+                }
+            }
+
+            public class BaseViewModel3
+            {
+                protected void OnGreetUserFailed(Exception e)
+                {
+                }
+            }
+
+            public partial class SampleViewModel3 : BaseViewModel3
+            {
+                [RelayCommand(OnExecutionFailed = "OnGreetUserFailed")]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void AsyncVoidRelayCommandOnExecutionFailedMember_Warns()
+    {
+        // MVVMTK0060 is a warning, not an error: generation still proceeds, and the helper below
+        // asserts on all generator diagnostics regardless of severity, so it is verified the same way.
+        const string source = """
+            using System;
+            using System.Threading.Tasks;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private async void OnGreetUserFailed(Exception exception)
+                {
+                    await Task.Yield();
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0060");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandOnExecutionFailedMemberAmbiguousMatches()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(Exception exception)
+                {
+                }
+
+                private void OnGreetUserFailed(RelayCommandExceptionEventArgs e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0059");
+    }
+
+    [TestMethod]
+    public void ValidRelayCommandOnExecutionFailedMember_DoesNotReport()
+    {
+        // This is pinned to C# 12 (rather than the default C# 8 used by most tests in this file):
+        // RelayCommandAttribute.OnExecutionFailed is an init-only property, and attribute application
+        // syntax (`OnExecutionFailed = ...`) binding to an init accessor requires LangVersion >= 9. A
+        // block-scoped-namespace, default-language-version variant of this test was tried and it
+        // fails to compile for exactly that reason, with:
+        // CS8400: Feature 'init-only setters' is not available in C# 8.0. Please use language version 9.0 or greater.
+        // That is inherent to how init-only properties interact with attribute named arguments,
+        // and unrelated to the OnExecutionFailed getter-block emission this test otherwise verifies.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed))]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(Exception exception)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandSuppressExceptionsWithoutOnExecutionFailed()
+    {
+        // Without an OnExecutionFailed handler no ExecutionFailed subscription is generated at all, so
+        // there is nothing for SuppressExceptions to seed and the argument does nothing. This is a
+        // warning rather than an error: the command itself is perfectly valid.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(SuppressExceptions = true)]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12, "MVVMTK0061");
+    }
+
+    [TestMethod]
+    public void InvalidRelayCommandSuppressExceptionsWithoutOnExecutionFailed_FalseStillReports()
+    {
+        // The value is irrelevant: neither setting does anything without a handler to route faults to.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(SuppressExceptions = false)]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12, "MVVMTK0061");
+    }
+
+    [TestMethod]
+    public void ValidRelayCommandSuppressExceptionsWithOnExecutionFailed_DoesNotReport()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnGreetUserFailed), SuppressExceptions = true)]
+                private void GreetUser()
+                {
+                }
+
+                private void OnGreetUserFailed(Exception exception)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void ValidRelayCommandWithoutSuppressExceptions_DoesNotReport()
+    {
+        // The warning is only for an explicitly written argument, so a plain [RelayCommand] is unaffected.
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class SampleViewModel
+            {
+                [RelayCommand]
+                private void GreetUser()
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void RelayCommandWithOverriddenOnExecutionFailedMember_DoesNotReport()
+    {
+        // An override chain of a single virtual handler produces multiple matches for the
+        // OnExecutionFailed name, but they all belong to the same overridden method hierarchy, so
+        // this is not ambiguous (the same carve-out used for CanExecute and MVVMTK0010).
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.ComponentModel;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class BaseViewModel : ObservableObject
+            {
+                protected virtual void OnDoStuffFailed(Exception exception)
+                {
+                }
+            }
+
+            public partial class SampleViewModel : BaseViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnDoStuffFailed))]
+                private void DoStuff()
+                {
+                }
+
+                protected override void OnDoStuffFailed(Exception exception)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, LanguageVersion.CSharp12);
+    }
+
+    [TestMethod]
+    public void RelayCommandWithOverriddenOnExecutionFailedMember_WithOneMethodNotInTheSameHierarchy_Reports()
+    {
+        const string source = """
+            using System;
+            using CommunityToolkit.Mvvm.ComponentModel;
+            using CommunityToolkit.Mvvm.Input;
+
+            namespace MyApp;
+
+            public partial class BaseViewModel : ObservableObject
+            {
+                protected virtual void OnDoStuffFailed(Exception exception)
+                {
+                }
+            }
+
+            public partial class SampleViewModel : BaseViewModel
+            {
+                [RelayCommand(OnExecutionFailed = nameof(OnDoStuffFailed))]
+                private void DoStuff()
+                {
+                }
+
+                protected override void OnDoStuffFailed(Exception exception)
+                {
+                }
+
+                private void OnDoStuffFailed(RelayCommandExceptionEventArgs e)
+                {
+                }
+            }
+            """;
+
+        VerifyGeneratedDiagnostics<RelayCommandGenerator>(source, "MVVMTK0059");
+    }
+
     /// <summary>
     /// Verifies the diagnostic errors for a given analyzer, and that all available source generators can run successfully with the input source (including subsequent compilation).
     /// </summary>
