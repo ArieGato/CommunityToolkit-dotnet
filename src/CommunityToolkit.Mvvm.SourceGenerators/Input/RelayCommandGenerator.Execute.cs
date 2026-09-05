@@ -71,6 +71,7 @@ partial class RelayCommandGenerator
                 out string? commandClassType,
                 out string? delegateType,
                 out bool supportsCancellation,
+                out ITypeSymbol? commandParameterType,
                 out ImmutableArray<string> commandTypeArguments,
                 out ImmutableArray<string> commandTypeArgumentsWithNullabilityAnnotations,
                 out ImmutableArray<string> delegateTypeArgumentsWithNullabilityAnnotations))
@@ -135,6 +136,21 @@ partial class RelayCommandGenerator
 
             token.ThrowIfCancellationRequested();
 
+            // Get the OnExecutionFailed handler info, if any
+            if (!TryGetOnExecutionFailedInfo(
+                methodSymbol,
+                attributeData,
+                commandParameterType,
+                in builder,
+                out string? onExecutionFailedMemberName,
+                out bool onExecutionFailedUsesEventArgs,
+                out bool suppressExceptions))
+            {
+                goto Failure;
+            }
+
+            token.ThrowIfCancellationRequested();
+
             // Get all forwarded attributes (don't stop in case of errors, just ignore faulting attributes)
             GatherForwardedAttributes(
                 methodSymbol,
@@ -159,6 +175,9 @@ partial class RelayCommandGenerator
                 allowConcurrentExecutions,
                 flowExceptionsToTaskScheduler,
                 generateCancelCommand,
+                onExecutionFailedMemberName,
+                onExecutionFailedUsesEventArgs,
+                suppressExceptions,
                 forwardedAttributes);
 
             diagnostics = builder.ToImmutable();
@@ -316,6 +335,26 @@ partial class RelayCommandGenerator
             // [global::System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
             // <FORWARDED_ATTRIBUTES>
             // public <COMMAND_TYPE> <COMMAND_PROPERTY_NAME> => <COMMAND_FIELD_NAME> ??= new <RELAY_COMMAND_TYPE>(<COMMAND_CREATION_ARGUMENTS>);
+            //
+            // When an OnExecutionFailed handler is present, the property is instead emitted with a getter
+            // block that creates the command and subscribes the handler on first access. The command is
+            // built into a local and only assigned to the backing field once the subscription is in place,
+            // so that no other thread can ever observe a published command with no handler attached:
+            //
+            // public <COMMAND_TYPE> <COMMAND_PROPERTY_NAME>
+            // {
+            //     get
+            //     {
+            //         if (<COMMAND_FIELD_NAME> is null)
+            //         {
+            //             <RELAY_COMMAND_TYPE> <LOCAL_NAME> = new <RELAY_COMMAND_TYPE>(<COMMAND_CREATION_ARGUMENTS>);
+            //             <LOCAL_NAME>.ExecutionFailed += (s, e) => ...;
+            //             <COMMAND_FIELD_NAME> = <LOCAL_NAME>;
+            //         }
+            //
+            //         return <COMMAND_FIELD_NAME>;
+            //     }
+            // }
             PropertyDeclarationSyntax propertyDeclaration =
                 PropertyDeclaration(
                     IdentifierName(commandInterfaceTypeName),
@@ -332,15 +371,122 @@ partial class RelayCommandGenerator
                         SyntaxKind.OpenBracketToken,
                         TriviaList())),
                     AttributeList(SingletonSeparatedList(Attribute(IdentifierName("global::System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage")))))
-                .AddAttributeLists(forwardedPropertyAttributes)
-                .WithExpressionBody(
-                    ArrowExpressionClause(
+                .AddAttributeLists(forwardedPropertyAttributes);
+
+            if (commandInfo.OnExecutionFailedMemberName is null)
+            {
+                propertyDeclaration = propertyDeclaration
+                    .WithExpressionBody(
+                        ArrowExpressionClause(
+                            AssignmentExpression(
+                                SyntaxKind.CoalesceAssignmentExpression,
+                                IdentifierName(commandInfo.FieldName),
+                                ObjectCreationExpression(IdentifierName(commandClassTypeName))
+                                .AddArgumentListArguments(commandCreationArguments.ToArray()))))
+                    .WithSemicolonToken(Token(SyntaxKind.SemicolonToken));
+            }
+            else
+            {
+                // Prepare the ExecutionFailed subscription. The handler is passed the event args themselves, or
+                // just the exception, depending on the parameter type it declares:
+                //
+                // <FIELD>.ExecutionFailed += (s, e) => <HANDLER>(e);
+                // <FIELD>.ExecutionFailed += (s, e) => <HANDLER>(e.Exception);
+                //
+                // That is the whole subscription by default: attaching a handler observes the fault without
+                // changing whether it propagates. When SuppressExceptions is set, the handled state is seeded
+                // as well. For a handler taking event args the seed is written before the call, so that the
+                // handler can still override the decision in either direction:
+                //
+                // <FIELD>.ExecutionFailed += (s, e) => { e.Handled = true; <HANDLER>(e); };
+                //
+                // For a handler taking just the exception there is nothing to override, since it cannot observe
+                // the event args at all, so the seed is written after the call instead:
+                //
+                // <FIELD>.ExecutionFailed += (s, e) => { <HANDLER>(e.Exception); e.Handled = true; };
+                ExpressionSyntax handlerArgument = commandInfo.OnExecutionFailedUsesEventArgs
+                    ? IdentifierName("e")
+                    : MemberAccessExpression(
+                        SyntaxKind.SimpleMemberAccessExpression,
+                        IdentifierName("e"),
+                        IdentifierName("Exception"));
+
+                InvocationExpressionSyntax handlerInvocation =
+                    InvocationExpression(IdentifierName(commandInfo.OnExecutionFailedMemberName))
+                    .AddArgumentListArguments(Argument(handlerArgument));
+
+                ParenthesizedLambdaExpressionSyntax handlerLambda =
+                    ParenthesizedLambdaExpression()
+                    .AddParameterListParameters(Parameter(Identifier("s")), Parameter(Identifier("e")));
+
+                if (commandInfo.SuppressExceptions)
+                {
+                    ExpressionStatementSyntax handledSeedStatement =
+                        ExpressionStatement(
+                            AssignmentExpression(
+                                SyntaxKind.SimpleAssignmentExpression,
+                                MemberAccessExpression(
+                                    SyntaxKind.SimpleMemberAccessExpression,
+                                    IdentifierName("e"),
+                                    IdentifierName("Handled")),
+                                LiteralExpression(SyntaxKind.TrueLiteralExpression)));
+
+                    handlerLambda = handlerLambda.WithBlock(commandInfo.OnExecutionFailedUsesEventArgs
+                        ? Block(handledSeedStatement, ExpressionStatement(handlerInvocation))
+                        : Block(ExpressionStatement(handlerInvocation), handledSeedStatement));
+                }
+                else
+                {
+                    handlerLambda = handlerLambda.WithExpressionBody(handlerInvocation);
+                }
+
+                // Get the name of the local the command is built into before being published to the backing
+                // field. Every identifier that the getter body can possibly reference is checked here, so
+                // that the local can never shadow a member the rest of the emitted code needs to bind to.
+                string localCommandName = "command";
+
+                while (localCommandName == commandInfo.FieldName ||
+                       localCommandName == commandInfo.MethodName ||
+                       localCommandName == commandInfo.OnExecutionFailedMemberName ||
+                       localCommandName == commandInfo.CanExecuteMemberName)
+                {
+                    localCommandName = $"_{localCommandName}";
+                }
+
+                StatementSyntax subscriptionStatement =
+                    ExpressionStatement(
                         AssignmentExpression(
-                            SyntaxKind.CoalesceAssignmentExpression,
-                            IdentifierName(commandInfo.FieldName),
-                            ObjectCreationExpression(IdentifierName(commandClassTypeName))
-                            .AddArgumentListArguments(commandCreationArguments.ToArray()))))
-                .WithSemicolonToken(Token(SyntaxKind.SemicolonToken));
+                            SyntaxKind.AddAssignmentExpression,
+                            MemberAccessExpression(
+                                SyntaxKind.SimpleMemberAccessExpression,
+                                IdentifierName(localCommandName),
+                                IdentifierName("ExecutionFailed")),
+                            handlerLambda));
+
+                propertyDeclaration = propertyDeclaration
+                    .AddAccessorListAccessors(
+                        AccessorDeclaration(SyntaxKind.GetAccessorDeclaration)
+                        .WithBody(Block(
+                            IfStatement(
+                                IsPatternExpression(
+                                    IdentifierName(commandInfo.FieldName),
+                                    ConstantPattern(LiteralExpression(SyntaxKind.NullLiteralExpression))),
+                                Block(
+                                    LocalDeclarationStatement(
+                                        VariableDeclaration(IdentifierName(commandClassTypeName))
+                                        .AddVariables(
+                                            VariableDeclarator(Identifier(localCommandName))
+                                            .WithInitializer(EqualsValueClause(
+                                                ObjectCreationExpression(IdentifierName(commandClassTypeName))
+                                                .AddArgumentListArguments(commandCreationArguments.ToArray()))))),
+                                    subscriptionStatement,
+                                    ExpressionStatement(
+                                        AssignmentExpression(
+                                            SyntaxKind.SimpleAssignmentExpression,
+                                            IdentifierName(commandInfo.FieldName),
+                                            IdentifierName(localCommandName))))),
+                            ReturnStatement(IdentifierName(commandInfo.FieldName)))));
+            }
 
             // Conditionally declare the additional members for the cancel commands
             if (commandInfo.IncludeCancelCommand)
@@ -522,6 +668,7 @@ partial class RelayCommandGenerator
         /// <param name="commandClassType">The command class type name.</param>
         /// <param name="delegateType">The delegate type name for the wrapped method.</param>
         /// <param name="supportsCancellation">Indicates whether or not the resulting command supports cancellation.</param>
+        /// <param name="commandParameterType">The type of the command parameter (ie. the <c>T</c> in <c>RelayCommand&lt;T&gt;</c>), if the command has one.</param>
         /// <param name="commandTypeArguments">The type arguments for <paramref name="commandInterfaceType"/> and <paramref name="commandClassType"/>, if any.</param>
         /// <param name="commandTypeArgumentsWithNullabilityAnnotations">Same as <paramref name="commandTypeArguments"/>, but with nullability annotations.</param>
         /// <param name="delegateTypeArgumentsWithNullabilityAnnotations">The type arguments for <paramref name="delegateType"/>, if any, with nullability annotations.</param>
@@ -533,6 +680,7 @@ partial class RelayCommandGenerator
             [NotNullWhen(true)] out string? commandClassType,
             [NotNullWhen(true)] out string? delegateType,
             out bool supportsCancellation,
+            out ITypeSymbol? commandParameterType,
             out ImmutableArray<string> commandTypeArguments,
             out ImmutableArray<string> commandTypeArgumentsWithNullabilityAnnotations,
             out ImmutableArray<string> delegateTypeArgumentsWithNullabilityAnnotations)
@@ -544,7 +692,8 @@ partial class RelayCommandGenerator
                 commandClassType = "global::CommunityToolkit.Mvvm.Input.RelayCommand";
                 delegateType = "global::System.Action";
                 supportsCancellation = false;
-                commandTypeArguments = ImmutableArray<string>.Empty; 
+                commandParameterType = null;
+                commandTypeArguments = ImmutableArray<string>.Empty;
                 commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
                 delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
 
@@ -560,6 +709,7 @@ partial class RelayCommandGenerator
                 commandClassType = "global::CommunityToolkit.Mvvm.Input.RelayCommand";
                 delegateType = "global::System.Action";
                 supportsCancellation = false;
+                commandParameterType = parameter.Type;
                 commandTypeArguments = ImmutableArray.Create(parameter.Type.GetFullyQualifiedName());
                 commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(parameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations());
                 delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(parameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations());
@@ -577,6 +727,7 @@ partial class RelayCommandGenerator
                     commandClassType = "global::CommunityToolkit.Mvvm.Input.AsyncRelayCommand";
                     delegateType = "global::System.Func";
                     supportsCancellation = false;
+                    commandParameterType = null;
                     commandTypeArguments = ImmutableArray<string>.Empty;
                     commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
                     delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create("global::System.Threading.Tasks.Task");
@@ -594,6 +745,7 @@ partial class RelayCommandGenerator
                         commandClassType = "global::CommunityToolkit.Mvvm.Input.AsyncRelayCommand";
                         delegateType = "global::System.Func";
                         supportsCancellation = true;
+                        commandParameterType = null;
                         commandTypeArguments = ImmutableArray<string>.Empty;
                         commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
                         delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create("global::System.Threading.CancellationToken", "global::System.Threading.Tasks.Task");
@@ -606,6 +758,7 @@ partial class RelayCommandGenerator
                     commandClassType = "global::CommunityToolkit.Mvvm.Input.AsyncRelayCommand";
                     delegateType = "global::System.Func";
                     supportsCancellation = false;
+                    commandParameterType = singleParameter.Type;
                     commandTypeArguments = ImmutableArray.Create(singleParameter.Type.GetFullyQualifiedName());
                     commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(singleParameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations());
                     delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(singleParameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations(), "global::System.Threading.Tasks.Task");
@@ -623,6 +776,7 @@ partial class RelayCommandGenerator
                     commandClassType = "global::CommunityToolkit.Mvvm.Input.AsyncRelayCommand";
                     delegateType = "global::System.Func";
                     supportsCancellation = true;
+                    commandParameterType = firstParameter.Type;
                     commandTypeArguments = ImmutableArray.Create(firstParameter.Type.GetFullyQualifiedName());
                     commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(firstParameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations());
                     delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray.Create(firstParameter.Type.GetFullyQualifiedNameWithNullabilityAnnotations(), "global::System.Threading.CancellationToken", "global::System.Threading.Tasks.Task");
@@ -637,8 +791,9 @@ partial class RelayCommandGenerator
             commandClassType = null;
             delegateType = null;
             supportsCancellation = false;
+            commandParameterType = null;
             commandTypeArguments = ImmutableArray<string>.Empty;
-            commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty; 
+            commandTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
             delegateTypeArgumentsWithNullabilityAnnotations = ImmutableArray<string>.Empty;
 
             return false;
@@ -758,6 +913,174 @@ partial class RelayCommandGenerator
 
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Checks whether or not the user has requested an exception handler for the command, and validates it.
+        /// </summary>
+        /// <param name="methodSymbol">The input <see cref="IMethodSymbol"/> instance to process.</param>
+        /// <param name="attributeData">The <see cref="AttributeData"/> instance the method was annotated with.</param>
+        /// <param name="commandParameterType">The type of the command parameter (ie. the <c>T</c> in <c>RelayCommand&lt;T&gt;</c>), if the command has one.</param>
+        /// <param name="diagnostics">The current collection of gathered diagnostics.</param>
+        /// <param name="onExecutionFailedMemberName">The resulting exception handler member name, if available.</param>
+        /// <param name="onExecutionFailedUsesEventArgs">Whether the handler takes a <c>RelayCommandExceptionEventArgs</c> parameter (otherwise, an <c>Exception</c> parameter).</param>
+        /// <param name="suppressExceptions">Whether a routed fault should be seeded as handled, suppressing the rethrow.</param>
+        /// <returns>Whether or not a value for <paramref name="onExecutionFailedMemberName"/> could be determined (may include <see langword="null"/>).</returns>
+        private static bool TryGetOnExecutionFailedInfo(
+            IMethodSymbol methodSymbol,
+            AttributeData attributeData,
+            ITypeSymbol? commandParameterType,
+            in ImmutableArrayBuilder<DiagnosticInfo> diagnostics,
+            out string? onExecutionFailedMemberName,
+            out bool onExecutionFailedUsesEventArgs,
+            out bool suppressExceptions)
+        {
+            onExecutionFailedMemberName = null;
+            onExecutionFailedUsesEventArgs = false;
+
+            // Get the suppression switch, if any (the default is to leave a routed fault unhandled, so that
+            // attaching a handler observes it without changing whether it propagates)
+            bool hasSuppressExceptions = attributeData.TryGetNamedArgument("SuppressExceptions", out suppressExceptions);
+
+            // Get the OnExecutionFailed member name, if any (the default is none)
+            if (!attributeData.TryGetNamedArgument("OnExecutionFailed", out string? memberName))
+            {
+                // With no handler to subscribe, no ExecutionFailed subscription is emitted at all, so there is
+                // nothing for the suppression switch to seed. Report the dead argument, but keep generating:
+                // the command itself is perfectly valid, this is just a value that does nothing.
+                if (hasSuppressExceptions)
+                {
+                    diagnostics.Add(UnusedSuppressExceptionsWarning, methodSymbol, methodSymbol.Name, methodSymbol.ContainingType);
+                }
+
+                return true;
+            }
+
+            if (memberName is not null)
+            {
+                bool hasMatchingName = false;
+                ImmutableArray<ISymbol>.Builder validMatches = ImmutableArray.CreateBuilder<ISymbol>();
+
+                foreach (ISymbol member in methodSymbol.ContainingType!.GetAllMembers(memberName))
+                {
+                    hasMatchingName = true;
+
+                    // Only accept candidates the generated code can actually call. The call site is emitted into
+                    // the containing type of the annotated method, and GetAllMembers also walks the base type
+                    // hierarchy, so a generic candidate, one taking its parameter by 'ref' or 'out', or one that
+                    // is not accessible from that type would all emit code that fails to compile, pointing the
+                    // user at a generated file they never wrote. Rejecting them here instead lets them fall
+                    // through to the MVVMTK0058 path below (hasMatchingName is already set), which reports the
+                    // invalid signature on the user's own declaration. Note that 'in' parameters and static
+                    // handlers are both perfectly callable, so they are deliberately still accepted.
+                    if (member is IMethodSymbol { ReturnsVoid: true, IsGenericMethod: false, Parameters.Length: 1 } candidateSymbol &&
+                        candidateSymbol.Parameters[0].RefKind is not (RefKind.Out or RefKind.Ref) &&
+                        IsAccessibleFromGeneratedCode(candidateSymbol, methodSymbol.ContainingType) &&
+                        (candidateSymbol.Parameters[0].Type.HasFullyQualifiedMetadataName("System.Exception") ||
+                         IsExceptionEventArgsType(candidateSymbol.Parameters[0].Type, commandParameterType)))
+                    {
+                        validMatches.Add(candidateSymbol);
+                    }
+                }
+
+                // We specifically allow targeting methods which are overridden: they'll be more than one,
+                // but it doesn't matter since you'd only ever call "one", being the most derived one. This
+                // mirrors the same carve-out used for the CanExecute member name matching logic below.
+                if (validMatches.Count > 1 && !validMatches.ToImmutable().AreAllInSameOverriddenMethodHierarchy())
+                {
+                    diagnostics.Add(MultipleOnExecutionFailedMemberMatchesError, methodSymbol, memberName, methodSymbol.ContainingType);
+
+                    return false;
+                }
+
+                if (validMatches.Count >= 1)
+                {
+                    IMethodSymbol candidateSymbol = (IMethodSymbol)validMatches[0];
+
+                    // An 'async void' handler is a valid signature as far as the subscription goes, but the command
+                    // has no way to await it: it returns at its first await, so the fault is considered observed
+                    // before the handler has actually finished, and anything the remainder of it throws reaches the
+                    // synchronization context unhandled. Warn, but still wire it up, as the user might be doing the
+                    // asynchronous work deliberately (eg. after having already set Handled synchronously).
+                    if (candidateSymbol.IsAsync)
+                    {
+                        diagnostics.Add(AsyncVoidOnExecutionFailedMemberWarning, methodSymbol, memberName, methodSymbol.ContainingType);
+                    }
+
+                    onExecutionFailedMemberName = memberName;
+                    onExecutionFailedUsesEventArgs = IsExceptionEventArgsType(candidateSymbol.Parameters[0].Type, commandParameterType);
+
+                    return true;
+                }
+
+                if (hasMatchingName)
+                {
+                    diagnostics.Add(InvalidOnExecutionFailedMemberSignatureError, methodSymbol, memberName, methodSymbol.ContainingType);
+
+                    return false;
+                }
+            }
+
+            diagnostics.Add(InvalidOnExecutionFailedMemberNameError, methodSymbol, memberName ?? string.Empty, methodSymbol.ContainingType);
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether a candidate exception handler parameter type is a supported event args type for a given command.
+        /// </summary>
+        /// <param name="parameterType">The type of the single parameter of the candidate exception handler.</param>
+        /// <param name="commandParameterType">The type of the command parameter, if the command has one.</param>
+        /// <returns>Whether <paramref name="parameterType"/> is a valid event args type for the target command.</returns>
+        /// <remarks>
+        /// Both the non-generic <c>RelayCommandExceptionEventArgs</c> and the generic <c>RelayCommandExceptionEventArgs&lt;T&gt;</c>
+        /// are accepted, but the latter only when <c>T</c> is exactly the command parameter type. That is the only case where the
+        /// generated subscription (which is on an <c>EventHandler&lt;RelayCommandExceptionEventArgs&lt;T&gt;&gt;</c> event) can
+        /// actually pass the event args to the handler without a cast. Any other generic instantiation, as well as any generic
+        /// instantiation at all on a parameterless command, would produce code that fails to compile, so it is rejected here and
+        /// reported as an invalid signature on the user's own declaration instead.
+        /// </remarks>
+        private static bool IsExceptionEventArgsType(ITypeSymbol parameterType, ITypeSymbol? commandParameterType)
+        {
+            // The non-generic event args type is always valid, for all command shapes
+            if (parameterType.HasFullyQualifiedMetadataName("CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs"))
+            {
+                return true;
+            }
+
+            // The generic one is only valid on a command with a parameter, and only for that exact parameter type
+            return
+                commandParameterType is not null &&
+                parameterType is INamedTypeSymbol { TypeArguments.Length: 1 } namedParameterType &&
+                parameterType.HasFullyQualifiedMetadataName("CommunityToolkit.Mvvm.Input.RelayCommandExceptionEventArgs`1") &&
+                SymbolEqualityComparer.Default.Equals(namedParameterType.TypeArguments[0], commandParameterType);
+        }
+
+        /// <summary>
+        /// Checks whether a candidate exception handler member can be invoked from the type the generated code is emitted into.
+        /// </summary>
+        /// <param name="candidateSymbol">The candidate exception handler member to check.</param>
+        /// <param name="containingType">The type the generated command code is emitted into.</param>
+        /// <returns>Whether <paramref name="candidateSymbol"/> is accessible from <paramref name="containingType"/>.</returns>
+        /// <remarks>
+        /// This check is done purely symbolically, as there is no <see cref="Compilation"/> available in this context.
+        /// </remarks>
+        private static bool IsAccessibleFromGeneratedCode(ISymbol candidateSymbol, INamedTypeSymbol containingType)
+        {
+            // A private member is only visible if it is declared by the very same type. Candidates are gathered
+            // across the whole base type hierarchy, and a private member of some base type is not accessible here.
+            if (candidateSymbol.DeclaredAccessibility == Accessibility.Private)
+            {
+                return SymbolEqualityComparer.Default.Equals(candidateSymbol.ContainingType, containingType);
+            }
+
+            // An 'internal' (or 'private protected') member is only visible from within the same assembly
+            if (candidateSymbol.DeclaredAccessibility is Accessibility.Internal or Accessibility.ProtectedAndInternal)
+            {
+                return SymbolEqualityComparer.Default.Equals(candidateSymbol.ContainingAssembly, containingType.ContainingAssembly);
+            }
+
+            return true;
         }
 
         /// <summary>

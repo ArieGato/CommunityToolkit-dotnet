@@ -18,7 +18,7 @@ namespace CommunityToolkit.Mvvm.Input;
 /// A command that mirrors the functionality of <see cref="RelayCommand"/>, with the addition of
 /// accepting a <see cref="Func{TResult}"/> returning a <see cref="Task"/> as the execute
 /// action, and providing an <see cref="ExecutionTask"/> property that notifies changes when
-/// <see cref="ExecuteAsync"/> is invoked and when the returned <see cref="Task"/> completes.
+/// <see cref="ExecuteAsync(object?)"/> is invoked and when the returned <see cref="Task"/> completes.
 /// </summary>
 public sealed partial class AsyncRelayCommand : IAsyncRelayCommand, ICancellationAwareCommand
 {
@@ -74,6 +74,46 @@ public sealed partial class AsyncRelayCommand : IAsyncRelayCommand, ICancellatio
 
     /// <inheritdoc/>
     public event EventHandler? CanExecuteChanged;
+
+    /// <summary>
+    /// Raised when the execution task of the command completes in a faulted state. If at least one
+    /// handler is attached when the fault is observed, the exception is passed to the event. On the
+    /// <see cref="Execute(object?)"/> path, the exception is then only rethrown (on the captured context)
+    /// if no handler sets <see cref="RelayCommandExceptionEventArgs.Handled"/> to <see langword="true"/>,
+    /// and the command was not created with
+    /// <see cref="AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler"/>, which suppresses that rethrow
+    /// regardless of what any handler does.
+    /// When the task returned by <see cref="ExecuteAsync(object?)"/> is awaited directly, the event is
+    /// raised as well, but the exception is always delivered to the awaiter:
+    /// <see cref="ExecuteAsync(object?)"/> always returns the execution task itself (the very same
+    /// instance as <see cref="ExecutionTask"/>), so the caller observes the fault through it and
+    /// <see cref="RelayCommandExceptionEventArgs.Handled"/> has no effect on that path. That is,
+    /// <see cref="RelayCommandExceptionEventArgs.Handled"/> only affects the
+    /// <see cref="System.Windows.Input.ICommand.Execute(object?)"/> path, which is the one where nobody
+    /// else could observe the fault. If no handler is attached, exceptions propagate exactly as before:
+    /// rethrown on the calling context by default, or flowing to
+    /// <see cref="System.Threading.Tasks.TaskScheduler.UnobservedTaskException"/> when
+    /// <see cref="AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler"/> is used. A canceled execution
+    /// never raises this event.
+    /// </summary>
+    /// <remarks>
+    /// When this event has subscribers and <see cref="AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler"/>
+    /// is used, a fault is observed by the command in order to raise this event, instead of reaching
+    /// <see cref="System.Threading.Tasks.TaskScheduler.UnobservedTaskException"/>: subscribing the event is
+    /// the more explicit, more local opt-in. Whether a given execution is observed for this event at all is
+    /// decided when the execution starts, on either the <see cref="Execute(object?)"/> or the
+    /// <see cref="ExecuteAsync(object?)"/> path, while the handlers that get notified are read when the fault
+    /// is actually observed, following standard event semantics. If the event had no subscribers at that point,
+    /// the execution is not observed for this event and a handler attached later is not notified for that
+    /// execution (a command with no subscribers takes the same path it would if the event did not exist). A handler detached before the fault is
+    /// observed is likewise not notified, and the fault then propagates as if the event had never had
+    /// subscribers; note that with <see cref="AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler"/> the
+    /// calling <see cref="Execute(object?)"/> has already committed to awaiting the task, so such a fault has
+    /// already been observed and does not reach
+    /// <see cref="System.Threading.Tasks.TaskScheduler.UnobservedTaskException"/> either. It remains available
+    /// through <see cref="ExecutionTask"/>.
+    /// </remarks>
+    public event EventHandler<RelayCommandExceptionEventArgs>? ExecutionFailed;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="AsyncRelayCommand"/> class.
@@ -279,18 +319,42 @@ public sealed partial class AsyncRelayCommand : IAsyncRelayCommand, ICancellatio
     /// <inheritdoc/>
     public void Execute(object? parameter)
     {
-        Task executionTask = ExecuteAsync(parameter);
+        // The event is raised from this path below, so the observer is suppressed to avoid raising twice.
+        Task executionTask = ExecuteAsync(parameter, raiseExecutionFailed: false);
 
-        // If exceptions shouldn't flow to the task scheduler, await the resulting task. This is
-        // delegated to a separate method to keep this one more compact in case the option is set.
-        if ((this.options & AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler) == 0)
+        // With at least one subscriber, the task is awaited by the routing observer: this path is where a
+        // fault is delivered to the event, and where it is rethrown on the captured context if no handler
+        // marks it as handled. That holds even with AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler,
+        // since notifying subscribers is reason enough to observe the task (the option still suppresses the
+        // rethrow itself, from inside the observer).
+        if (ExecutionFailed is not null)
         {
+            AwaitAndRouteExecutionFailed(executionTask);
+        }
+        else if ((this.options & AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler) == 0)
+        {
+            // With no subscriber there is nothing to route, so the plain awaiter is used instead. It has no
+            // exception handling region and is static, so it neither pays for a try/catch nor captures 'this'
+            // in its state machine. This keeps a command that never uses ExecutionFailed exactly as cheap as
+            // it was before the event existed, and mirrors the same no-subscriber carve-out that
+            // RelayCommand.Execute makes for the very same reason.
             AwaitAndThrowIfFailed(executionTask);
         }
     }
 
     /// <inheritdoc/>
     public Task ExecuteAsync(object? parameter)
+    {
+        return ExecuteAsync(parameter, raiseExecutionFailed: true);
+    }
+
+    /// <summary>
+    /// Executes the current command, optionally observing the resulting task to raise <see cref="ExecutionFailed"/>.
+    /// </summary>
+    /// <param name="parameter">The input parameter.</param>
+    /// <param name="raiseExecutionFailed">Whether a fault should be observed and routed through <see cref="ExecutionFailed"/> by this method. This is <see langword="false"/> when the caller (ie. <see cref="Execute"/>) takes care of that itself.</param>
+    /// <returns>The <see cref="Task"/> representing the async operation being executed, which is always the same instance as <see cref="ExecutionTask"/>.</returns>
+    private Task ExecuteAsync(object? parameter, bool raiseExecutionFailed)
     {
         Task executionTask;
 
@@ -316,6 +380,13 @@ public sealed partial class AsyncRelayCommand : IAsyncRelayCommand, ICancellatio
             CanExecuteChanged?.Invoke(this, EventArgs.Empty);
         }
 
+        // If the event has subscribers at this point, observe a fault so they are notified, without
+        // altering what the caller receives: the returned task is always the execution task itself.
+        if (raiseExecutionFailed && ExecutionFailed is not null)
+        {
+            RaiseExecutionFailedWhenFaulted(executionTask);
+        }
+
         return executionTask;
     }
 
@@ -332,22 +403,125 @@ public sealed partial class AsyncRelayCommand : IAsyncRelayCommand, ICancellatio
     }
 
     /// <summary>
-    /// Awaits an input <see cref="Task"/> and throws an exception on the calling context, if the task fails.
+    /// Awaits an execution task on the <see cref="Execute"/> path when <see cref="ExecutionFailed"/> has no
+    /// subscribers, rethrowing a fault on the captured context.
     /// </summary>
-    /// <param name="executionTask">The input <see cref="Task"/> instance to await.</param>
+    /// <param name="executionTask">The execution task to await.</param>
+    /// <remarks>
+    /// This is the counterpart of <see cref="AwaitAndRouteExecutionFailed"/> for the case where there is
+    /// nothing to route. It deliberately contains no exception handling region and is <see langword="static"/>,
+    /// so that a command which never uses <see cref="ExecutionFailed"/> pays neither for a try/catch nor for
+    /// capturing <see langword="this"/> in the state machine. See the notes in
+    /// <see cref="AwaitAndRouteExecutionFailed"/> for why this is an <see langword="async"/>
+    /// <see langword="void"/> method.
+    /// </remarks>
     internal static async void AwaitAndThrowIfFailed(Task executionTask)
     {
-        // Note: this method is purposefully an async void method awaiting the input task. This is done so that
-        // if an async relay command is invoked synchronously (ie. when Execute is called, eg. from a binding),
-        // exceptions in the wrapped delegate will not be ignored or just become visible through the ExecutionTask
-        // property, but will be rethrown in the original synchronization context by default. This makes the behavior
-        // more consistent with how normal commands work (where exceptions are also just normally propagated to the
-        // caller context), and avoids getting an app into an inconsistent state in case a method faults without
-        // other components being notified. It is also possible to not await this task and to instead ignore exceptions
-        // and then inspect them manually from the ExecutionTask property, by constructing an async command instance
-        // using the AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler option. That will cause this call to
-        // be skipped, and exceptions will just either normally be available through that property, or will otherwise
-        // flow to the static TaskScheduler.UnobservedTaskException event if otherwise unobserved (eg. for logging).
         await executionTask;
+    }
+
+    /// <summary>
+    /// Observes an execution task and raises <see cref="ExecutionFailed"/> if it faults, without
+    /// altering the task the caller received: the caller observes the fault itself, so
+    /// <see cref="RelayCommandExceptionEventArgs.Handled"/> has no effect on this path. A canceled
+    /// execution never raises the event.
+    /// </summary>
+    /// <param name="executionTask">The execution task to observe.</param>
+    private async void RaiseExecutionFailedWhenFaulted(Task executionTask)
+    {
+        try
+        {
+            await executionTask;
+        }
+        catch (Exception e)
+        {
+            // This observer must never rethrow: the caller owns the returned task and sees the fault
+            // through it. Only a faulted execution is routed, never a canceled one. Standard event
+            // semantics also apply: the handler list is read when the event is raised, so a handler
+            // detached while the execution was in flight is simply not notified.
+            if (!executionTask.IsCanceled && ExecutionFailed is EventHandler<RelayCommandExceptionEventArgs> executionFailed)
+            {
+                // A task can fault with more than one exception (eg. Task.WhenAll). Awaiting surfaces only the
+                // first, so hand the handler the full AggregateException rather than silently dropping the rest.
+                Exception routedException = executionTask.Exception is AggregateException { InnerExceptions.Count: > 1 } aggregateException
+                    ? aggregateException
+                    : e;
+
+                executionFailed(this, new RelayCommandExceptionEventArgs(routedException));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Awaits an execution task on the <see cref="Execute"/> path and routes a fault through
+    /// <see cref="ExecutionFailed"/>, rethrowing it on the captured context if no handler marks it as
+    /// handled and the command was not created with
+    /// <see cref="AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler"/>. A canceled execution is
+    /// never routed, and is likewise never rethrown when that option is set.
+    /// </summary>
+    /// <param name="executionTask">The execution task to await.</param>
+    private async void AwaitAndRouteExecutionFailed(Task executionTask)
+    {
+        // Note: this method is purposefully an async void method awaiting the input task. That is the mechanism the
+        // rethrow below relies on, not an incidental detail: the state machine hands an unhandled exception to
+        // AsyncVoidMethodBuilder.SetException, which posts it to the captured synchronization context. So when an
+        // async relay command is invoked synchronously (ie. when Execute is called, eg. from a binding), a fault in
+        // the wrapped delegate is not ignored, nor left only visible through the ExecutionTask property, but surfaces
+        // on the original context. An 'async Task' method would not do: nothing awaits the returned task, so the
+        // fault would simply be parked in it and the rethrow would become a no-op. This keeps the behavior consistent
+        // with how normal commands work (where exceptions are also just normally propagated to the caller context),
+        // and avoids getting an app into an inconsistent state in case a method faults without other components
+        // being notified.
+        //
+        // Two things suppress that rethrow. A handler subscribed to ExecutionFailed can mark the fault as handled,
+        // and a command constructed with AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler never rethrows on
+        // the captured context at all. In the latter case Execute skips this call entirely unless ExecutionFailed
+        // has subscribers, since notifying them is the only remaining reason to await the task here.
+        //
+        // Note that awaiting the task observes it. With no subscribers and the flow option set, this method is not
+        // called, the fault stays available through ExecutionTask, and reaches the static
+        // TaskScheduler.UnobservedTaskException event if nothing else observes it (eg. for logging). Once the event
+        // has subscribers that no longer holds: the await below observes the fault, so UnobservedTaskException does
+        // not fire for it. Subscribing to ExecutionFailed is the more explicit, more local opt-in of the two.
+        try
+        {
+            await executionTask;
+        }
+        catch (Exception e)
+        {
+            // Only a faulted execution is routed, never a canceled one. Standard event semantics also
+            // apply: the handler list is read when the event is raised, so a handler detached while the
+            // execution was in flight is simply not notified, and the fault just propagates.
+            if (!executionTask.IsCanceled &&
+                ExecutionFailed is EventHandler<RelayCommandExceptionEventArgs> executionFailed)
+            {
+                // A task can fault with more than one exception (eg. Task.WhenAll). Awaiting surfaces only the
+                // first, so hand the handler the full AggregateException rather than silently dropping the rest.
+                Exception routedException = executionTask.Exception is AggregateException { InnerExceptions.Count: > 1 } aggregateException
+                    ? aggregateException
+                    : e;
+
+                RelayCommandExceptionEventArgs args = new(routedException);
+
+                executionFailed(this, args);
+
+                if (args.Handled)
+                {
+                    return;
+                }
+            }
+
+            // This task is only being awaited at all because the event has subscribers: a command created with
+            // the flow option asked for no rethrow on the captured context, and subscribing to the event must
+            // change who gets notified of a fault, never whether that fault escapes. So nothing is rethrown from
+            // here in that configuration, for a fault and a cancellation alike. The exception remains observable
+            // through ExecutionTask, exactly as it would be with no subscribers attached.
+            if ((this.options & AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler) != 0)
+            {
+                return;
+            }
+
+            throw;
+        }
     }
 }

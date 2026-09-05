@@ -595,4 +595,828 @@ public class Test_AsyncRelayCommand
         Assert.IsFalse(command.CanBeCanceled);
         Assert.IsTrue(command.IsCancellationRequested);
     }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_HandledSuppressesException()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        object? sender = null;
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            sender = s;
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        // No exception must escape to the synchronization context (AsyncContext.Run would rethrow it)
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            // Deterministically wait for the command to finish instead of a fixed delay: the faulted
+            // task is observed here, but the event has already been routed by the command internally.
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        });
+
+        Assert.AreSame(command, sender);
+        Assert.AreSame(exception, routedException);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_NotHandledRethrowsOnCapturedContext()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        Exception? routedException = null;
+        Exception? contextException = null;
+
+        command.ExecutionFailed += (s, e) => routedException = e.Exception;
+
+        try
+        {
+            AsyncContext.Run(async () =>
+            {
+                command.Execute(null);
+
+                // Deterministically wait for the faulted task, swallowing the exception here: the one
+                // that must surface from AsyncContext.Run is the command's own rethrow on the captured
+                // context, not the one this await would otherwise produce.
+                try
+                {
+                    await command.ExecutionTask!;
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            contextException = e;
+        }
+
+        Assert.AreSame(exception, routedException);
+        Assert.AreSame(exception, contextException);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_CancellationDoesNotRaise()
+    {
+        AsyncRelayCommand command = new(token => Task.Delay(1000, token));
+
+        bool raised = false;
+
+        command.ExecutionFailed += (s, e) => raised = true;
+
+        try
+        {
+            AsyncContext.Run(async () =>
+            {
+                command.Execute(null);
+
+                command.Cancel();
+
+                // Deterministically wait for the canceled task to complete instead of a fixed delay.
+                await command.ExecutionTask!;
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // Today's propagation of the canceled task is intentionally untouched
+        }
+
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_SuccessfulExecutionDoesNotRaise()
+    {
+        // The delegate returns an already completed task, so both the Execute and the ExecuteAsync
+        // observers run to completion synchronously and the assertions below need no extra waiting.
+        int executions = 0;
+
+        AsyncRelayCommand command = new(() =>
+        {
+            executions++;
+
+            return Task.CompletedTask;
+        });
+
+        bool raised = false;
+
+        command.ExecutionFailed += (s, e) => raised = true;
+
+        command.Execute(null);
+
+        // Assert the delegate actually ran, so this can distinguish "the event was
+        // not raised because the execution succeeded" from "nothing ran at all".
+        Assert.AreEqual(1, executions);
+        Assert.IsFalse(raised);
+
+        await command.ExecuteAsync(null);
+
+        Assert.AreEqual(2, executions);
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_FlowExceptionsToTaskScheduler_SubscriberReceivesFault()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        }, AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler);
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        });
+
+        Assert.AreSame(exception, routedException);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_FlowExceptionsToTaskScheduler_DirectExecuteAsync_HandledStillThrowsToAwaiter()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        }, AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler);
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        // The flow option makes no difference on this path: the returned task is the execution task, so
+        // the fault is observed by the awaiter (never reaching TaskScheduler.UnobservedTaskException),
+        // and marking it as handled does not change that.
+        Task task = command.ExecuteAsync(null);
+
+        Assert.AreSame(command.ExecutionTask, task);
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => task);
+
+        Assert.AreSame(exception, thrown);
+        Assert.AreSame(exception, routedException);
+        Assert.IsTrue(command.ExecutionTask!.IsFaulted);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_Multicast_SecondHandlerStillRunsAfterFirstMarksHandled()
+    {
+        // Both handlers are part of the same multicast invocation: the first setting Handled to true
+        // must not prevent the second one from also running, since it's the same event args instance
+        // being shared. The awaited task still faults, as Handled does not apply to this path.
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        bool secondHandlerRan = false;
+
+        command.ExecutionFailed += (s, e) => e.Handled = true;
+        command.ExecutionFailed += (s, e) => secondHandlerRan = true;
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => command.ExecuteAsync(null));
+
+        Assert.AreSame(exception, thrown);
+        Assert.IsTrue(secondHandlerRan);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_FaultedWithOperationCanceledExceptionIsRouted()
+    {
+        // A task that is Faulted (not Canceled) raises the event even when the
+        // fault is an OperationCanceledException: the rule is task-status-based.
+        OperationCanceledException exception = new();
+        AsyncRelayCommand command = new(() => Task.FromException(exception));
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        Assert.AreSame(exception, routedException);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_HandledStillThrowsToAwaiter()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        // ExecuteAsync always returns the execution task itself, so a caller awaiting it always observes
+        // the fault: the event is still raised (the handler runs), but Handled has no effect here, as it
+        // only suppresses the rethrow on the ICommand.Execute path.
+        Task task = command.ExecuteAsync(null);
+
+        Assert.AreSame(command.ExecutionTask, task);
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => task);
+
+        Assert.AreSame(exception, thrown);
+
+        // The handler still ran, and observed the very same exception
+        Assert.AreSame(exception, routedException);
+
+        Assert.IsTrue(command.ExecutionTask!.IsFaulted);
+        Assert.IsFalse(command.IsRunning);
+        Assert.IsTrue(command.CanExecute(null));
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_NotHandledThrows()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) => routedException = e.Exception;
+
+        // With a subscriber that does not mark the fault as handled, the event is raised first and
+        // the original exception still surfaces at the await, exactly like the sync rethrow.
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => command.ExecuteAsync(null));
+
+        Assert.AreSame(exception, thrown);
+        Assert.AreSame(exception, routedException);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_MultiFaultTaskRoutesAllExceptions()
+    {
+        InvalidOperationException first = new("First");
+        FormatException second = new("Second");
+
+        AsyncRelayCommand command = new(() => Task.WhenAll(Task.FromException(first), Task.FromException(second)));
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) => routedException = e.Exception;
+
+        // Awaiting a task that faulted with several exceptions only surfaces the first one, so the awaiter
+        // still sees exactly that (unchanged behavior), but the handler gets the whole AggregateException.
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => command.ExecuteAsync(null));
+
+        Assert.AreSame(first, thrown);
+
+        AggregateException aggregateException = Assert.IsInstanceOfType<AggregateException>(routedException);
+
+        Assert.HasCount(2, aggregateException.InnerExceptions);
+        Assert.Contains(first, aggregateException.InnerExceptions);
+        Assert.Contains(second, aggregateException.InnerExceptions);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_Execute_MultiFaultTaskRoutesAllExceptions()
+    {
+        InvalidOperationException first = new("First");
+        FormatException second = new("Second");
+
+        AsyncRelayCommand command = new(() => Task.WhenAll(Task.FromException(first), Task.FromException(second)));
+
+        Exception? routedException = null;
+        Exception? contextException = null;
+
+        command.ExecutionFailed += (s, e) => routedException = e.Exception;
+
+        try
+        {
+            AsyncContext.Run(async () =>
+            {
+                command.Execute(null);
+
+                // Deterministically wait for the faulted task, swallowing the exception here: the one that
+                // must surface from AsyncContext.Run is the command's own rethrow on the captured context.
+                try
+                {
+                    await command.ExecutionTask!;
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            contextException = e;
+        }
+
+        // The rethrow on the captured context is a bare 'throw', so it stays the first inner exception,
+        // matching what an await would have produced anywhere else in .NET.
+        Assert.AreSame(first, contextException);
+
+        AggregateException aggregateException = Assert.IsInstanceOfType<AggregateException>(routedException);
+
+        Assert.HasCount(2, aggregateException.InnerExceptions);
+        Assert.Contains(first, aggregateException.InnerExceptions);
+        Assert.Contains(second, aggregateException.InnerExceptions);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_NoSubscriberThrowsAndPreservesTaskIdentity()
+    {
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        Task task = command.ExecuteAsync(null);
+
+        // With no subscribers when ExecuteAsync is invoked, the returned task is the execution task
+        // itself (same instance), and the fault propagates to the awaiter unchanged.
+        Assert.AreSame(command.ExecutionTask, task);
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => task);
+
+        Assert.AreSame(exception, thrown);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_CancellationDoesNotRaise()
+    {
+        AsyncRelayCommand command = new(token => Task.Delay(1000, token));
+
+        bool raised = false;
+
+        command.ExecutionFailed += (s, e) => raised = true;
+
+        Task task = command.ExecuteAsync(null);
+
+        command.Cancel();
+
+        // A canceled execution propagates cancellation to the awaiter and never raises the event
+        _ = await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => task);
+
+        // The returned task itself completes as canceled, not faulted
+        Assert.IsTrue(task.IsCanceled);
+
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_ThrowingHandlerDoesNotAlterAwaitedException()
+    {
+        InvalidOperationException exception = new("Test");
+        NotSupportedException handlerException = new("Handler");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        command.ExecutionFailed += (s, e) => throw handlerException;
+
+        Exception? awaitedException = null;
+        Exception? contextException = null;
+
+        // A handler throwing while the command is merely observing the fault cannot corrupt what the
+        // awaiter sees: the returned task is the execution task, so the original exception surfaces
+        // there. The handler exception escapes the observer instead, on the captured context.
+        try
+        {
+            AsyncContext.Run(async () =>
+            {
+                try
+                {
+                    await command.ExecuteAsync(null);
+                }
+                catch (Exception e)
+                {
+                    awaitedException = e;
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            contextException = e;
+        }
+
+        Assert.AreSame(exception, awaitedException);
+        Assert.AreSame(handlerException, contextException);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_SubscriberAttachedAfterInvokeIsNotRouted()
+    {
+        InvalidOperationException exception = new("Test");
+        TaskCompletionSource<object?> tcs = new();
+
+        AsyncRelayCommand command = new(() => tcs.Task);
+
+        Task task = command.ExecuteAsync(null);
+
+        bool raised = false;
+
+        // Subscribers are sampled when ExecuteAsync is invoked: at that point there were none, so
+        // the execution task itself was returned and a later subscriber is not routed for it.
+        command.ExecutionFailed += (s, e) => raised = true;
+
+        tcs.SetException(exception);
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => task);
+
+        Assert.AreSame(exception, thrown);
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_SubscriberDetachedDuringExecutionIsNotRouted()
+    {
+        // Standard event semantics also apply to the observer: the handler list is read when the fault
+        // is observed, not when ExecuteAsync is invoked, so a handler detached while the execution was
+        // still in flight is not notified and the original exception surfaces unchanged at the await.
+        InvalidOperationException exception = new("Test");
+        TaskCompletionSource<object?> tcs = new();
+
+        AsyncRelayCommand command = null!;
+
+        bool raised = false;
+
+        void Handler(object? sender, RelayCommandExceptionEventArgs e)
+        {
+            raised = true;
+            e.Handled = true;
+        }
+
+        command = new AsyncRelayCommand(async () =>
+        {
+            // Yield until the test releases the execution, so the subscriber is guaranteed to still be
+            // attached when ExecuteAsync samples it and the execution is observed for the event.
+            _ = await tcs.Task;
+
+            command.ExecutionFailed -= Handler;
+
+            throw exception;
+        });
+
+        command.ExecutionFailed += Handler;
+
+        Task task = command.ExecuteAsync(null);
+
+        tcs.SetResult(null);
+
+        InvalidOperationException thrown = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => task);
+
+        Assert.AreSame(exception, thrown);
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public async Task Test_AsyncRelayCommand_ExecutionFailed_DirectExecuteAsync_SubscribedPathPreservesTaskIdentity()
+    {
+        TaskCompletionSource<object?> tcs = new();
+
+        AsyncRelayCommand command = new(() => tcs.Task);
+
+        command.ExecutionFailed += static (s, e) => { };
+
+        Task task = command.ExecuteAsync(null);
+
+        // Subscribing the event must not change what ExecuteAsync hands back: the returned task is
+        // always the execution task itself, both while the operation is running and after it has
+        // completed. Observing the fault for the event never wraps or replaces it.
+        Assert.AreSame(command.ExecutionTask, task);
+
+        tcs.SetResult(null);
+
+        await task;
+
+        Assert.AreSame(command.ExecutionTask, task);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_HandlerAttachedAfterExecuteIsNotNotified()
+    {
+        // Whether an execution is observed for this event is decided when the execution starts. With no
+        // subscribers at that point, Execute takes the plain awaiter that has no exception handling region
+        // at all, so a command that never uses the event costs exactly what it did before the event existed.
+        // A handler attached after that decision is therefore not notified for that execution, matching how
+        // the ExecuteAsync path has always behaved, and the fault propagates as it normally would.
+        TaskCompletionSource<object?> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            _ = await tcs.Task;
+
+            throw new InvalidOperationException("Test");
+        });
+
+        bool raised = false;
+
+        InvalidOperationException thrown = Assert.ThrowsExactly<InvalidOperationException>(() =>
+        {
+            AsyncContext.Run(async () =>
+            {
+                command.Execute(null);
+
+                // Attached after the execution already started, so it is not part of this execution
+                command.ExecutionFailed += (s, e) => raised = true;
+
+                tcs.SetResult(null);
+
+                try
+                {
+                    await command.ExecutionTask!;
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        });
+
+        Assert.IsNotNull(thrown);
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_HandlerAttachedBeforeExecuteIsNotified()
+    {
+        // The counterpart: attached before the execution starts, so the routing observer is installed and
+        // the handler is notified. This is the boundary the test above pins from the other side.
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+            e.Handled = true;
+        };
+
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        });
+
+        Assert.AreSame(exception, routedException);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_FlowExceptionsToTaskScheduler_UnhandledFaultDoesNotThrowOnCapturedContext()
+    {
+        // Regression test: with the flow option set, Execute only awaits the execution task because the
+        // event has subscribers. Subscribing must change who gets notified of a fault, never whether that
+        // fault escapes, so a handler that leaves it unhandled must not turn the flow option into a
+        // rethrow on the captured context (which would take the process down, as the await happens in an
+        // async void method). The fault stays observable through ExecutionTask.
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        }, AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler);
+
+        Exception? routedException = null;
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            routedException = e.Exception;
+
+            // Intentionally leaves e.Handled as false
+        };
+
+        // Nothing must escape here: AsyncContext.Run rethrows anything posted to the context
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        });
+
+        Assert.AreSame(exception, routedException);
+        Assert.IsTrue(command.ExecutionTask!.IsFaulted);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_UnhandledFaultStillThrowsOnCapturedContextWithoutFlowOption()
+    {
+        // The counterpart of the test above: without the flow option, an unhandled fault must still be
+        // rethrown on the captured context, which is the whole point of awaiting the task on this path.
+        InvalidOperationException exception = new("Test");
+
+        AsyncRelayCommand command = new(async () =>
+        {
+            await Task.CompletedTask;
+
+            throw exception;
+        });
+
+        command.ExecutionFailed += (s, e) =>
+        {
+            // Intentionally leaves e.Handled as false
+        };
+
+        InvalidOperationException thrown = Assert.ThrowsExactly<InvalidOperationException>(() =>
+        {
+            AsyncContext.Run(async () =>
+            {
+                command.Execute(null);
+
+                try
+                {
+                    await command.ExecutionTask!;
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        });
+
+        Assert.AreSame(exception, thrown);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_FlowExceptionsToTaskScheduler_CancelDoesNotThrowOnCapturedContext()
+    {
+        // Regression test: with the flow option set, Execute only awaits the execution task because the
+        // event has subscribers. A canceled execution never raises the event, so there is nothing to
+        // route and nothing to rethrow: the cancellation must not escape to the captured context (which
+        // would take the process down, as the await happens in an async void method).
+        AsyncRelayCommand command = new(
+            token => Task.Delay(System.Threading.Timeout.Infinite, token),
+            AsyncRelayCommandOptions.FlowExceptionsToTaskScheduler);
+
+        bool raised = false;
+
+        command.ExecutionFailed += (s, e) => raised = true;
+
+        // Nothing must escape here: AsyncContext.Run rethrows anything posted to the context
+        AsyncContext.Run(async () =>
+        {
+            command.Execute(null);
+
+            command.Cancel();
+
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        Assert.IsFalse(raised);
+    }
+
+    [TestMethod]
+    public void Test_AsyncRelayCommand_ExecutionFailed_SubscriptionDoesNotAffectCommandState()
+    {
+        InvalidOperationException exception = new("Test");
+        TaskCompletionSource<object?> tcs = new();
+
+        AsyncRelayCommand command = new(() => tcs.Task);
+
+        command.ExecutionFailed += (s, e) => e.Handled = true;
+
+        // Subscribing (and handling) the event must not change the command state flow:
+        // ExecutionTask, IsRunning and CanExecute behave exactly as without a subscriber,
+        // and the execution task itself still completes as faulted.
+        AsyncContext.Run(async () =>
+        {
+            Assert.IsTrue(command.CanExecute(null));
+
+            command.Execute(null);
+
+            Assert.IsNotNull(command.ExecutionTask);
+            Assert.IsTrue(command.IsRunning);
+            Assert.IsFalse(command.CanExecute(null));
+
+            tcs.SetException(exception);
+
+            // Deterministically wait for the command to observe the fault instead of a fixed delay.
+            try
+            {
+                await command.ExecutionTask!;
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            Assert.IsFalse(command.IsRunning);
+            Assert.IsTrue(command.CanExecute(null));
+            Assert.IsTrue(command.ExecutionTask!.IsFaulted);
+        });
+    }
 }
